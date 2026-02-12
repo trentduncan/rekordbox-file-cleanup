@@ -1,0 +1,1 @@
+Other tool to build is to look at hot cues of everything in a playlist and approximate the length of the set

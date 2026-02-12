@@ -32,7 +32,6 @@ DEFAULT_AUTO_EXCLUDES = ("_Rekordbox_Orphans",)
 class Config:
     xml_path: Path
     scan_roots: list[Path]
-    # exclude: list[Path]
 
 def parse_command_line_args() -> Config:
     ap = argparse.ArgumentParser(description="Read-only Rekordbox orphan check (by full normalized path).")
@@ -43,12 +42,6 @@ def parse_command_line_args() -> Config:
         required=True,
         help="Top-level directory to scan for audio files (repeatable). Example: --scan-root /Users/trent/Music/DJ_MUSIC",
     )
-    # ap.add_argument(
-    #     "--exclude",
-    #     default="",
-    #     help="Comma-separated directories to exclude (name, relative to each scan-root, or absolute path). "
-    #          "Example: '_Rekordbox_Orphans,Beatport,Beatsource'",
-    # )
 
     args = ap.parse_args()
 
@@ -61,7 +54,6 @@ def parse_command_line_args() -> Config:
     return Config(
         xml_path=xml_path,
         scan_roots=scan_roots,
-        # exclude=[],
     )
 
 def parse_rekordbox_xml(xml_path: Path) -> set[Path]:
@@ -138,25 +130,6 @@ def _normalize_path(p: Path) -> Path:
 
     # Canonicalize absolute/symlinks best-effort
     return p.resolve(strict=False)
-
-
-def debug_referenced_path(p: Path, scan_roots: list[Path]) -> None:
-    p_norm = _normalize_path(p)
-    roots_norm = [_normalize_path(r) for r in scan_roots]
-
-    print("P:", p)
-    print("P_NORM:", p_norm)
-    print("EXISTS:", p_norm.exists())
-
-    for r in roots_norm:
-        try:
-            p_norm.relative_to(r)
-            print("UNDER ROOT:", r)
-            break
-        except ValueError:
-            pass
-    else:
-        print("NOT UNDER ANY ROOT")
 
 
 def main() -> int:

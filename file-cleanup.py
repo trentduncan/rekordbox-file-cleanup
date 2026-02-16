@@ -11,18 +11,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import unquote, urlparse
+import json
+import shutil
 
 
 DEFAULT_EXTENSIONS = ("mp3", "wav", "aiff", "aif", "flac", "m4a")
-DEFAULT_AUTO_EXCLUDES = ("_Rekordbox_Orphans",)
-
-# Parse cmd line Args x
-# Parse xml rekordbox collection x
-# loop through collection normalize the path and set it into a data structure for easy lookups (set or map) x
-# Recursively parse through all directories, to flatten the list of files, normalize the urls x
-# loop through the raw files and compare them to what exists in the rekordbox_collection_keyed_by_url output orphaned files x
-# Loop through files and move all orphaned files into orphans directory, when moving to the orphaned directory, output a file of the path of the file before moving it to allow for a restore functionality function
-# write restore method
+DEFAULT_ORPHANS_DIR_NAME = "_Rekordbox_Orphans"
+DEFAULT_AUTO_EXCLUDES = (DEFAULT_ORPHANS_DIR_NAME,)
+DEFAULT_MANIFEST_NAME = "orphans_manifest.jsonl"
 
 # TODO: At the end update to latest rekordbox version and test the XML parsing
 # TODO: Write unit tests
@@ -32,7 +28,9 @@ DEFAULT_AUTO_EXCLUDES = ("_Rekordbox_Orphans",)
 class Config:
     xml_path: Path
     scan_roots: list[Path]
-
+    restore: bool
+    check_collection: bool
+    dry_run: bool
 def parse_command_line_args() -> Config:
     ap = argparse.ArgumentParser(description="Read-only Rekordbox orphan check (by full normalized path).")
     ap.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
@@ -41,6 +39,21 @@ def parse_command_line_args() -> Config:
         action="append",
         required=True,
         help="Top-level directory to scan for audio files (repeatable). Example: --scan-root /Users/trent/Music/DJ_MUSIC",
+    )
+    ap.add_argument(
+        "--restore",
+        action="store_true",
+        help="Restore orphaned files from the manifest"
+    )
+    ap.add_argument(
+    "--check-collection",
+    action="store_true",
+    help="Verify Rekordbox collection references against disk; optionally also validate a manifest if present.",
+)
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="When moving/restoring files, only print what would be done without making changes."
     )
 
     args = ap.parse_args()
@@ -54,6 +67,9 @@ def parse_command_line_args() -> Config:
     return Config(
         xml_path=xml_path,
         scan_roots=scan_roots,
+        restore=args.restore,
+        check_collection=args.check_collection,
+        dry_run=args.dry_run,
     )
 
 def parse_rekordbox_xml(xml_path: Path) -> set[Path]:
@@ -79,8 +95,17 @@ def flatten_raw_files(scan_roots: list[Path]) -> list[Path]:
         if not root.exists() or not root.is_dir():
             continue
 
-        for dirpath, _, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in DEFAULT_AUTO_EXCLUDES
+            ]
+
             for name in filenames:
+                # Ignore macOS AppleDouble metadata files
+                if name.startswith("._"):
+                    continue
+
                 path = _normalize_path((Path(dirpath) / name))
                 if path.suffix.lower() in exts:
                     results.append(path)
@@ -90,11 +115,141 @@ def flag_orphans(rekordbox_locations_set: set[Path], raw_files: list[Path]) -> l
     orphans = [f for f in raw_files if f not in rekordbox_locations_set]
     return orphans
 
-def move_orphans(orphans: list[Path], target_dir: Path) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for orphan in orphans:
-        target_path = target_dir / orphan.name
-        orphan.rename(target_path)
+def move_orphans_flat(
+    orphans: Iterable[Path],
+    *,
+    orphans_dir: Path,
+    dry_run: bool = True,
+) -> dict[str, int]:
+    """
+    Move orphan files into a flat orphans directory and append a JSONL manifest mapping
+    original path -> new path for restore.
+
+    Manifest lines look like:
+      {"ts": ..., "src": "...", "dst": "...", "size_bytes": ..., "mtime": ..., "dev": ..., "ino": ...}
+    """
+    orphans_dir = _normalize_path(orphans_dir)
+    orphans_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = orphans_dir / DEFAULT_MANIFEST_NAME
+
+    moved = 0
+    skipped_missing = 0
+    errors = 0
+
+    with open(manifest_path, "a", encoding="utf-8") as mf:
+        for src in orphans:
+            src = _normalize_path(src)
+
+            if not src.exists():
+                skipped_missing += 1
+                continue
+
+            try:
+                st = src.stat()
+                dev = getattr(st, "st_dev", None)
+                ino = getattr(st, "st_ino", None)
+
+                # Flat folder: start with original basename
+                dst = orphans_dir / src.name
+                dst = _unique_destination_path(dst)
+
+                record = {
+                    "ts": int(time.time()),
+                    "src": str(src),
+                    "dst": str(dst),
+                    "size_bytes": int(st.st_size),
+                    "mtime": float(st.st_mtime),
+                    "dev": int(dev) if dev is not None else None,
+                    "ino": int(ino) if ino is not None else None,
+                }
+
+                if dry_run:
+                    print("[DRY RUN] MOVE", src, "->", dst)
+                    continue
+
+                shutil.move(str(src), str(dst))
+
+                # Only record after a successful move
+                mf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                mf.flush()
+
+                moved += 1
+
+            except Exception as e:
+                errors += 1
+                print("[ERROR] Failed to move:", src)
+                print("        ", repr(e))
+
+    return {"moved": moved, "skipped_missing": skipped_missing, "errors": errors}
+
+def restore_from_manifest(
+    *,
+    manifest_path: Path,
+    dry_run: bool = True,
+) -> dict[str, int]:
+    """
+    Restore files from a JSONL manifest created by move_orphans_flat().
+    Moves each record["dst"] back to record["src"].
+    """
+    manifest_path = _normalize_path(manifest_path)
+    if not manifest_path.exists():
+        raise SystemExit(f"Manifest not found: {manifest_path}")
+
+    restored = 0
+    skipped_missing = 0
+    errors = 0
+
+    remaining_records: list[str] = []
+
+
+    with open(manifest_path, "r", encoding="utf-8") as mf:
+        for line in mf:
+            line = line.strip()
+            if not line:
+                continue
+
+            rec = json.loads(line)
+            src = _normalize_path(Path(rec["src"]))
+            dst = _normalize_path(Path(rec["dst"]))
+
+            if not dst.exists():
+                skipped_missing += 1
+                print("[SKIP] dst missing:", dst)
+                continue
+
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+
+                if dry_run:
+                    print("[DRY RUN] RESTORE", dst, "->", src)
+                    continue
+
+                shutil.move(str(dst), str(src))
+                restored += 1
+
+            except Exception as e:
+                errors += 1
+                print("[ERROR] Failed to restore:", dst)
+                print("        ", repr(e))
+                remaining_records.append(line)
+
+        if not dry_run:
+            tmp_path = manifest_path.with_suffix(".tmp")
+
+            with open(tmp_path, "w", encoding="utf-8") as mf:
+                for line in remaining_records:
+                    mf.write(line.rstrip() + "\n")
+
+            tmp_path.replace(manifest_path)
+
+            # Optional: if manifest is empty, delete it
+            if not remaining_records:
+                manifest_path.unlink(missing_ok=True)
+
+
+    return {"restored": restored, "skipped_missing": skipped_missing, "errors": errors}
+
 
 def _convert_rekordbox_location_to_path(loc: str) -> Optional[Path]:
     loc = (loc or "").strip()
@@ -132,41 +287,94 @@ def _normalize_path(p: Path) -> Path:
     return p.resolve(strict=False)
 
 
+def _unique_destination_path(dest: Path) -> Path:
+    """
+    If dest exists, add " (1)", " (2)" etc before suffix.
+    """
+    if not dest.exists():
+        return dest
+
+    stem = dest.stem
+    suffix = dest.suffix
+    parent = dest.parent
+
+    i = 1
+    while True:
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def find_manifest_entries_that_break_collection(
+    *,
+    referenced: set[Path],
+    manifest_path: Path,
+) -> list[tuple[Path, Path]]:
+    bad: list[tuple[Path, Path]] = []
+    manifest_path = _normalize_path(manifest_path)
+
+    with open(manifest_path, "r", encoding="utf-8") as mf:
+        for line in mf:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            src = _normalize_path(Path(rec["src"]))
+            dst = _normalize_path(Path(rec["dst"]))
+
+            # if src was referenced and now missing, this entry likely caused it
+            if src in referenced and not src.exists() and dst.exists():
+                bad.append((src, dst))
+    return bad
+
+
 def main() -> int:
     config = parse_command_line_args()
     xml_path = config.xml_path
     scan_roots = config.scan_roots
+    restore = config.restore
+    check_collection = config.check_collection
+    dry_run = config.dry_run
+    manifest_path = _normalize_path(scan_roots[0]) / DEFAULT_ORPHANS_DIR_NAME / DEFAULT_MANIFEST_NAME
+
+    if restore:
+        stats = restore_from_manifest(manifest_path=manifest_path, dry_run=dry_run)
+        print("Restore stats:", stats)
+        return 0    
+
+    orphans_dir = _normalize_path(scan_roots[0]) / DEFAULT_ORPHANS_DIR_NAME
 
     rekordbox_locations_set = parse_rekordbox_xml(xml_path)
+    if check_collection:
+        missing_on_disk = [p for p in rekordbox_locations_set if not p.exists()]
+        print("Collection references missing on disk:", len(missing_on_disk))
+        for p in missing_on_disk[:25]:
+            print("  MISSING:", p)
+
+        bad = []
+        if manifest_path.exists():
+            bad = find_manifest_entries_that_break_collection(referenced=missing_on_disk, manifest_path=manifest_path)
+
+        print("Manifest entries that appear to break collection:", len(bad))
+        for src, dst in bad[:25]:
+            print("  MOVED REFERENCED:", src)
+            print("    ->", dst)
+        return 0
+
     raw_files = flatten_raw_files(scan_roots)
 
     orphans = flag_orphans(rekordbox_locations_set, raw_files)
-    orphans = orphans[:5]
+    orphans = orphans
 
+    print("Orphaned files found:", len(orphans))
 
-
-
-    
-    # raw_set = set(raw_files)
-    # missing = sorted(rekordbox_locations_set - raw_set, key=str)
-
-    # missing_on_disk = [p for p in missing if not p.exists()]
-    # exists_not_scanned = [p for p in missing if p.exists()]
-
-    # print("Referenced not in raw (total):", len(missing))
-    # print("  Missing on disk:", len(missing_on_disk))
-    # print("  Exists but not scanned:", len(exists_not_scanned))
-
-    # print("\nFirst 10 missing on disk:")
-    # for p in missing_on_disk[:10]:
-    #     print("  ", p)
-
-    # print("\nFirst 10 exists but not scanned:")
-    # for p in exists_not_scanned[:10]:
-    #     print("  ", p)
-
-
-
+    stats = move_orphans_flat(
+        orphans,
+        orphans_dir=orphans_dir,
+        dry_run=dry_run,
+    )
+    print("Move stats:", stats)
 
 
 

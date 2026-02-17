@@ -30,7 +30,10 @@ class Config:
     scan_roots: list[Path]
     restore: bool
     check_collection: bool
-    dry_run: bool
+    dry_run: bool # Remove when everything seems stable and working well
+    verbose: bool
+    preview: bool
+
 def parse_command_line_args() -> Config:
     ap = argparse.ArgumentParser(description="Read-only Rekordbox orphan check (by full normalized path).")
     ap.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
@@ -55,6 +58,16 @@ def parse_command_line_args() -> Config:
         action="store_true",
         help="When moving/restoring files, only print what would be done without making changes."
     )
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print additional debug information during processing."
+    )
+    ap.add_argument(
+        "--preview",
+        action="store_true",
+        help="Preview orphaned files without making any changes."
+    )
 
     args = ap.parse_args()
 
@@ -63,6 +76,10 @@ def parse_command_line_args() -> Config:
         raise SystemExit(f"XML not found: {xml_path}")
     
     scan_roots = [Path(p).expanduser() for p in args.scan_root]
+    for r in scan_roots:
+        if not r.exists() or not r.is_dir():
+            raise SystemExit(f"Scan root not a directory: {r}")
+
 
     return Config(
         xml_path=xml_path,
@@ -70,6 +87,8 @@ def parse_command_line_args() -> Config:
         restore=args.restore,
         check_collection=args.check_collection,
         dry_run=args.dry_run,
+        verbose=args.verbose,
+        preview=args.preview,
     )
 
 def parse_rekordbox_xml(xml_path: Path) -> set[Path]:
@@ -103,7 +122,7 @@ def flatten_raw_files(scan_roots: list[Path]) -> list[Path]:
 
             for name in filenames:
                 # Ignore macOS AppleDouble metadata files
-                if name.startswith("._"):
+                if _should_ignore_filename(name):
                     continue
 
                 path = _normalize_path((Path(dirpath) / name))
@@ -167,7 +186,7 @@ def move_orphans_flat(
                 if dry_run:
                     print("[DRY RUN] MOVE", src, "->", dst)
                     continue
-
+                
                 shutil.move(str(src), str(dst))
 
                 # Only record after a successful move
@@ -306,6 +325,10 @@ def _unique_destination_path(dest: Path) -> Path:
         i += 1
 
 
+def _should_ignore_filename(name: str) -> bool:
+    return name.startswith("._") or name == ".DS_Store"
+
+
 def find_manifest_entries_that_break_collection(
     *,
     referenced: set[Path],
@@ -336,6 +359,7 @@ def main() -> int:
     restore = config.restore
     check_collection = config.check_collection
     dry_run = config.dry_run
+    preview = config.preview
     manifest_path = _normalize_path(scan_roots[0]) / DEFAULT_ORPHANS_DIR_NAME / DEFAULT_MANIFEST_NAME
 
     if restore:
@@ -354,7 +378,7 @@ def main() -> int:
 
         bad = []
         if manifest_path.exists():
-            bad = find_manifest_entries_that_break_collection(referenced=missing_on_disk, manifest_path=manifest_path)
+            bad = find_manifest_entries_that_break_collection(referenced=rekordbox_locations_set, manifest_path=manifest_path)
 
         print("Manifest entries that appear to break collection:", len(bad))
         for src, dst in bad[:25]:
@@ -365,9 +389,15 @@ def main() -> int:
     raw_files = flatten_raw_files(scan_roots)
 
     orphans = flag_orphans(rekordbox_locations_set, raw_files)
-    orphans = orphans
+    if not orphans:
+            print("Great news: no orphans found! Your collection and disk are perfectly in sync. :)")
+            return 0
 
     print("Orphaned files found:", len(orphans))
+    if preview:
+        for f in orphans[:200]:
+            print("  ORPHAN:", f)
+        return 0
 
     stats = move_orphans_flat(
         orphans,

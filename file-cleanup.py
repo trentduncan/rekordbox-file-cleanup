@@ -14,10 +14,13 @@ from urllib.parse import unquote, urlparse
 import json
 import shutil
 
+MOVE_COMMAND = "move"
+PREVIEW_COMMAND = "preview"
+RESTORE_COMMAND = "restore"
 
 DEFAULT_EXTENSIONS = ("mp3", "wav", "aiff", "aif", "flac", "m4a")
 DEFAULT_ORPHANS_DIR_NAME = "_Rekordbox_Orphans"
-DEFAULT_AUTO_EXCLUDES = (DEFAULT_ORPHANS_DIR_NAME,)
+DEFAULT_EXCLUDED_DIRNAMES = (DEFAULT_ORPHANS_DIR_NAME,)
 DEFAULT_MANIFEST_NAME = "orphans_manifest.jsonl"
 
 # TODO: At the end update to latest rekordbox version and test the XML parsing
@@ -26,48 +29,38 @@ DEFAULT_MANIFEST_NAME = "orphans_manifest.jsonl"
 
 @dataclass(frozen=True)
 class Config:
+    cmd: str
     xml_path: Path
     scan_roots: list[Path]
-    restore: bool
-    check_collection: bool
-    dry_run: bool # Remove when everything seems stable and working well
-    verbose: bool
-    preview: bool
+    dry_run: bool
+    sample: int
+    orphans_dir: Path
+    manifest_path: Path
 
-def parse_command_line_args() -> Config:
-    ap = argparse.ArgumentParser(description="Read-only Rekordbox orphan check (by full normalized path).")
-    ap.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
-    ap.add_argument(
+def _add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
+    p.add_argument(
         "--scan-root",
         action="append",
         required=True,
         help="Top-level directory to scan for audio files (repeatable). Example: --scan-root /Users/trent/Music/DJ_MUSIC",
     )
-    ap.add_argument(
-        "--restore",
-        action="store_true",
-        help="Restore orphaned files from the manifest"
-    )
-    ap.add_argument(
-    "--check-collection",
-    action="store_true",
-    help="Verify Rekordbox collection references against disk; optionally also validate a manifest if present.",
-)
-    ap.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="When moving/restoring files, only print what would be done without making changes."
-    )
-    ap.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print additional debug information during processing."
-    )
-    ap.add_argument(
-        "--preview",
-        action="store_true",
-        help="Preview orphaned files without making any changes."
-    )
+    p.add_argument("--sample", type=int, default=25, help="How many example paths to print in preview (default: 25)")
+
+def parse_command_line_args() -> Config:
+    ap = argparse.ArgumentParser(description="Rekordbox orphan file cleaner (XML vs disk paths)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_move = sub.add_parser(MOVE_COMMAND, help="Move orphaned files into _Rekordbox_Orphans")
+    _add_common_args(p_move)
+    p_move.add_argument("--dry-run", action="store_true", help="Print move operations without changing anything")
+
+    p_preview = sub.add_parser(PREVIEW_COMMAND, help="Preview orphans + validate collection + manifest tripwires (no changes)")
+    _add_common_args(p_preview)
+
+    p_restore = sub.add_parser(RESTORE_COMMAND, help="Restore files from manifest (moves files back to original locations)")
+    _add_common_args(p_restore)
+    p_restore.add_argument("--dry-run", action="store_true", help="Print restore operations without changing anything")
 
     args = ap.parse_args()
 
@@ -81,17 +74,22 @@ def parse_command_line_args() -> Config:
             raise SystemExit(f"Scan root not a directory: {r}")
 
 
+    # TODO: support custom orphans dir and manifest path via CLI args if needed
+    base = _normalize_path(scan_roots[0])
+    orphans_dir = base / DEFAULT_ORPHANS_DIR_NAME
+    manifest_path = base / DEFAULT_ORPHANS_DIR_NAME / DEFAULT_MANIFEST_NAME
+
     return Config(
+        cmd=args.cmd,
         xml_path=xml_path,
         scan_roots=scan_roots,
-        restore=args.restore,
-        check_collection=args.check_collection,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-        preview=args.preview,
+        dry_run=getattr(args, "dry_run", False),
+        sample=args.sample,
+        orphans_dir=orphans_dir,
+        manifest_path=manifest_path,
     )
 
-def parse_rekordbox_xml(xml_path: Path) -> set[Path]:
+def scan_rekordbox_xml(xml_path: Path) -> set[Path]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -104,11 +102,15 @@ def parse_rekordbox_xml(xml_path: Path) -> set[Path]:
 
     return paths
 
-def flatten_raw_files(scan_roots: list[Path]) -> list[Path]:
+def scan_disk_files(scan_roots: list[Path]) -> set[Path]:
+    '''
+    Scan the given directories for audio files.
+    Returns a set of normalized absolute Paths for files with the specified extensions.
+    '''
     exts = {("." + e.lower().lstrip(".")) for e in (DEFAULT_EXTENSIONS)}
     scan_roots_norm = [_normalize_path(r) for r in scan_roots]
 
-    results: list[Path] = []
+    results: set[Path] = set()
 
     for root in scan_roots_norm:
         if not root.exists() or not root.is_dir():
@@ -117,7 +119,7 @@ def flatten_raw_files(scan_roots: list[Path]) -> list[Path]:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [
                 d for d in dirnames
-                if d not in DEFAULT_AUTO_EXCLUDES
+                if d not in DEFAULT_EXCLUDED_DIRNAMES
             ]
 
             for name in filenames:
@@ -127,12 +129,8 @@ def flatten_raw_files(scan_roots: list[Path]) -> list[Path]:
 
                 path = _normalize_path((Path(dirpath) / name))
                 if path.suffix.lower() in exts:
-                    results.append(path)
+                    results.add(path)
     return results
-
-def flag_orphans(rekordbox_locations_set: set[Path], raw_files: list[Path]) -> list[Path]:
-    orphans = [f for f in raw_files if f not in rekordbox_locations_set]
-    return orphans
 
 def move_orphans_flat(
     orphans: Iterable[Path],
@@ -207,20 +205,15 @@ def restore_from_manifest(
     manifest_path: Path,
     dry_run: bool = True,
 ) -> dict[str, int]:
-    """
-    Restore files from a JSONL manifest created by move_orphans_flat().
-    Moves each record["dst"] back to record["src"].
-    """
     manifest_path = _normalize_path(manifest_path)
     if not manifest_path.exists():
-        raise SystemExit(f"Manifest not found: {manifest_path}")
+        raise SystemExit(f"Nothing found in the orphans manifest to restore")
 
     restored = 0
     skipped_missing = 0
     errors = 0
 
     remaining_records: list[str] = []
-
 
     with open(manifest_path, "r", encoding="utf-8") as mf:
         for line in mf:
@@ -232,6 +225,7 @@ def restore_from_manifest(
             src = _normalize_path(Path(rec["src"]))
             dst = _normalize_path(Path(rec["dst"]))
 
+            #  Anything skipped here can be cleared out of the manifest since it can't be restored
             if not dst.exists():
                 skipped_missing += 1
                 print("[SKIP] dst missing:", dst)
@@ -269,7 +263,6 @@ def restore_from_manifest(
 
     return {"restored": restored, "skipped_missing": skipped_missing, "errors": errors}
 
-
 def _convert_rekordbox_location_to_path(loc: str) -> Optional[Path]:
     loc = (loc or "").strip()
     if not loc:
@@ -293,7 +286,6 @@ def _convert_rekordbox_location_to_path(loc: str) -> Optional[Path]:
 
     return Path(unquote(loc))
 
-
 def _normalize_path(p: Path) -> Path:
     # Expand ~ first
     p = p.expanduser()
@@ -304,7 +296,6 @@ def _normalize_path(p: Path) -> Path:
 
     # Canonicalize absolute/symlinks best-effort
     return p.resolve(strict=False)
-
 
 def _unique_destination_path(dest: Path) -> Path:
     """
@@ -324,12 +315,10 @@ def _unique_destination_path(dest: Path) -> Path:
             return candidate
         i += 1
 
-
 def _should_ignore_filename(name: str) -> bool:
     return name.startswith("._") or name == ".DS_Store"
 
-
-def find_manifest_entries_that_break_collection(
+def find_broken_moves_from_manifest(
     *,
     referenced: set[Path],
     manifest_path: Path,
@@ -337,75 +326,98 @@ def find_manifest_entries_that_break_collection(
     bad: list[tuple[Path, Path]] = []
     manifest_path = _normalize_path(manifest_path)
 
-    with open(manifest_path, "r", encoding="utf-8") as mf:
-        for line in mf:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            src = _normalize_path(Path(rec["src"]))
-            dst = _normalize_path(Path(rec["dst"]))
+    if manifest_path.exists():
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            for line in mf:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                src = _normalize_path(Path(rec["src"]))
+                dst = _normalize_path(Path(rec["dst"]))
 
-            # if src was referenced and now missing, this entry likely caused it
-            if src in referenced and not src.exists() and dst.exists():
-                bad.append((src, dst))
+                # if src was referenced and now missing, this entry likely caused it
+                if src in referenced and not src.exists() and dst.exists():
+                    bad.append((src, dst))
     return bad
 
+@dataclass(frozen=True)
+class ReconciledMetadata:
+    orphans: list[Path]
+    missing: list[Path]
+    missing_on_disk: list[Path]
+    exists_not_scanned: list[Path]
+
+def reconcile(referenced: set[Path], scanned: set[Path]) -> ReconciledMetadata:
+    orphans = sorted(scanned - referenced, key=str)
+    missing = sorted(referenced - scanned, key=str)
+    missing_on_disk = [p for p in missing if not p.exists()]
+    exists_not_scanned = [p for p in missing if p.exists()]
+    return ReconciledMetadata(orphans, missing, missing_on_disk, exists_not_scanned)
+
+def print_paths_sample(paths: Iterable[Path], label: str, sample: int = 25) -> None:
+    print(f"{label} ({len(paths)}):")
+    for p in sorted(paths, key=str)[:sample]:
+        print(f"  ", p)
+
+def log_preview(reconciled_meta: ReconciledMetadata, config: Config, referenced_paths: set[Path], scanned_paths: set[Path]) -> None:
+    print("=== Preview ===")
+    print("Orphans (disk files that are not in rekordbox collection that can be removed):", len(reconciled_meta.orphans))
+    if reconciled_meta.orphans:
+        print_paths_sample(reconciled_meta.orphans, "\nOrphans", sample=config.sample)
+
+    print("\n=== Additional Information ===")
+    print("Rekordbox collection records (XML):", len(referenced_paths))
+    print("Scanned disk files:", len(scanned_paths))
+    print("Rekordbox collection records not found in the provided scan_roots:", len(reconciled_meta.missing))
+    print("  Collection references missing on disk:", len(reconciled_meta.missing_on_disk))
+    print("  Exists but not scanned:", len(reconciled_meta.exists_not_scanned))
+    print("Orphans dir:", config.orphans_dir)
+    print("Manifest:", config.manifest_path)
+
+    if reconciled_meta.missing_on_disk:
+        print_paths_sample(reconciled_meta.missing_on_disk, "\nReferenced missing on disk", sample=config.sample)
 
 def main() -> int:
     config = parse_command_line_args()
-    xml_path = config.xml_path
-    scan_roots = config.scan_roots
-    restore = config.restore
-    check_collection = config.check_collection
-    dry_run = config.dry_run
-    preview = config.preview
-    manifest_path = _normalize_path(scan_roots[0]) / DEFAULT_ORPHANS_DIR_NAME / DEFAULT_MANIFEST_NAME
 
-    if restore:
-        stats = restore_from_manifest(manifest_path=manifest_path, dry_run=dry_run)
+    if config.cmd == RESTORE_COMMAND:
+        stats = restore_from_manifest(manifest_path=config.manifest_path, dry_run=config.dry_run)
         print("Restore stats:", stats)
         return 0    
 
-    orphans_dir = _normalize_path(scan_roots[0]) / DEFAULT_ORPHANS_DIR_NAME
+    referenced_paths = scan_rekordbox_xml(config.xml_path)
+    scanned_paths = scan_disk_files(config.scan_roots)
 
-    rekordbox_locations_set = parse_rekordbox_xml(xml_path)
-    if check_collection:
-        missing_on_disk = [p for p in rekordbox_locations_set if not p.exists()]
-        print("Collection references missing on disk:", len(missing_on_disk))
-        for p in missing_on_disk[:25]:
-            print("  MISSING:", p)
+    reconciled_meta = reconcile(referenced_paths, scanned_paths)
 
-        bad = []
-        if manifest_path.exists():
-            bad = find_manifest_entries_that_break_collection(referenced=rekordbox_locations_set, manifest_path=manifest_path)
-
-        print("Manifest entries that appear to break collection:", len(bad))
-        for src, dst in bad[:25]:
-            print("  MOVED REFERENCED:", src)
-            print("    ->", dst)
+    if config.cmd == PREVIEW_COMMAND:
+        log_preview(reconciled_meta, config, referenced_paths, scanned_paths)
+        bad = find_broken_moves_from_manifest(referenced=referenced_paths, manifest_path=config.manifest_path)
+        if bad:
+            print_paths_sample([f"  MOVED REFERENCED: {src}\n    -> {dst}" for src, dst in bad], "\nManifest entries that appear to break collection", sample=config.sample)
         return 0
 
-    raw_files = flatten_raw_files(scan_roots)
 
-    orphans = flag_orphans(rekordbox_locations_set, raw_files)
-    if not orphans:
-            print("Great news: no orphans found! Your collection and disk are perfectly in sync. :)")
-            return 0
-
-    print("Orphaned files found:", len(orphans))
-    if preview:
-        for f in orphans[:200]:
-            print("  ORPHAN:", f)
+    if config.cmd == MOVE_COMMAND:
+        if not reconciled_meta.orphans:
+                print("Great news: no orphans found! Your collection and disk are perfectly in sync. :)")
+                return 0
+        
+        print("Orphaned files found:", len(reconciled_meta.orphans))
+        stats = move_orphans_flat(
+            reconciled_meta.orphans,
+            orphans_dir=config.orphans_dir,
+            dry_run=config.dry_run,
+        )
+        print("Move stats:", stats)
+        bad = find_broken_moves_from_manifest(referenced=referenced_paths, manifest_path=config.manifest_path)
+        if bad:
+            print("\nWARNING: Found files that have been moved but are still referenced in the collection. This can cause broken links in rekordbox. Consider restoring these files from the manifest or manually moving them back to their original locations. If these are songs you care about, you may want to restore them instead of deleting. If they are truly unwanted, you can safely delete the moved files and then remove the corresponding entries from the manifest.")
+            print_paths_sample([f"  MOVED REFERENCED: {src}\n    -> {dst}" for src, dst in bad], "\nManifest entries that appear to break collection", sample=config.sample)
         return 0
-
-    stats = move_orphans_flat(
-        orphans,
-        orphans_dir=orphans_dir,
-        dry_run=dry_run,
-    )
-    print("Move stats:", stats)
-
+    
+    return 1
 
 
 if __name__ == "__main__":

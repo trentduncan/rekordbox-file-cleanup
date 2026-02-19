@@ -24,7 +24,6 @@ DEFAULT_EXCLUDED_DIRNAMES = (DEFAULT_ORPHANS_DIR_NAME,)
 DEFAULT_MANIFEST_NAME = "orphans_manifest.jsonl"
 
 # TODO: At the end update to latest rekordbox version and test the XML parsing
-# TODO: Write unit tests
 # NOTE: https://github.com/dylanljones/pyrekordbox
 
 @dataclass(frozen=True)
@@ -36,16 +35,6 @@ class Config:
     sample: int
     orphans_dir: Path
     manifest_path: Path
-
-def _add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
-    p.add_argument(
-        "--scan-root",
-        action="append",
-        required=True,
-        help="Top-level directory to scan for audio files (repeatable). Example: --scan-root /Users/trent/Music/DJ_MUSIC",
-    )
-    p.add_argument("--sample", type=int, default=25, help="How many example paths to print in preview (default: 25)")
 
 def parse_command_line_args() -> Config:
     ap = argparse.ArgumentParser(description="Rekordbox orphan file cleaner (XML vs disk paths)")
@@ -263,61 +252,6 @@ def restore_from_manifest(
 
     return {"restored": restored, "skipped_missing": skipped_missing, "errors": errors}
 
-def _convert_rekordbox_location_to_path(loc: str) -> Optional[Path]:
-    loc = (loc or "").strip()
-    if not loc:
-        return None
-
-    # Already a normal POSIX path
-    if loc.startswith("/"):
-        return Path(loc)
-
-    # Rekordbox often stores file URIs
-    if loc.lower().startswith("file:"):
-        # Handle odd "file:/localhost/..." by normalizing to "file://localhost/..."
-        if loc.lower().startswith("file:/") and not loc.lower().startswith("file://"):
-            loc = "file://" + loc[len("file:"):]
-
-        parsed = urlparse(loc)
-        if parsed.scheme.lower() == "file":
-            path_str = unquote(parsed.path or "")
-            if path_str:
-                return Path(path_str)
-
-    return Path(unquote(loc))
-
-def _normalize_path(p: Path) -> Path:
-    # Expand ~ first
-    p = p.expanduser()
-
-    # Normalize unicode consistently (macOS commonly uses NFD on disk)
-    s = unicodedata.normalize("NFD", str(p))
-    p = Path(s)
-
-    # Canonicalize absolute/symlinks best-effort
-    return p.resolve(strict=False)
-
-def _unique_destination_path(dest: Path) -> Path:
-    """
-    If dest exists, add " (1)", " (2)" etc before suffix.
-    """
-    if not dest.exists():
-        return dest
-
-    stem = dest.stem
-    suffix = dest.suffix
-    parent = dest.parent
-
-    i = 1
-    while True:
-        candidate = parent / f"{stem} ({i}){suffix}"
-        if not candidate.exists():
-            return candidate
-        i += 1
-
-def _should_ignore_filename(name: str) -> bool:
-    return name.startswith("._") or name == ".DS_Store"
-
 def find_broken_moves_from_manifest(
     *,
     referenced: set[Path],
@@ -377,6 +311,71 @@ def log_preview(reconciled_meta: ReconciledMetadata, config: Config, referenced_
 
     if reconciled_meta.missing_on_disk:
         print_paths_sample(reconciled_meta.missing_on_disk, "\nReferenced missing on disk", sample=config.sample)
+
+def _add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--rekordbox-xml", required=True, help="Path to Rekordbox exported collection XML")
+    p.add_argument(
+        "--scan-root",
+        action="append",
+        required=True,
+        help="Top-level directory to scan for audio files (repeatable). Example: --scan-root /Users/trent/Music/DJ_MUSIC",
+    )
+    p.add_argument("--sample", type=int, default=25, help="How many example paths to print in preview (default: 25)")
+
+def _convert_rekordbox_location_to_path(loc: str) -> Optional[Path]:
+    loc = (loc or "").strip()
+    if not loc:
+        return None
+
+    # Already a normal POSIX path
+    if loc.startswith("/"):
+        return Path(loc)
+
+    # Rekordbox often stores file URIs
+    if loc.lower().startswith("file:"):
+        # Handle odd "file:/localhost/..." by normalizing to "file://localhost/..."
+        if loc.lower().startswith("file:/") and not loc.lower().startswith("file://"):
+            loc = "file://" + loc[len("file:"):]
+
+        parsed = urlparse(loc)
+        if parsed.scheme.lower() == "file":
+            path_str = unquote(parsed.path or "")
+            if path_str:
+                return Path(path_str)
+
+    return Path(unquote(loc))
+
+def _normalize_path(p: Path) -> Path:
+    # Expand ~ first
+    p = p.expanduser()
+
+    # Normalize unicode consistently (macOS commonly uses NFD on disk)
+    s = unicodedata.normalize("NFD", str(p))
+    p = Path(s)
+
+    # Canonicalize absolute/symlinks best-effort
+    return p.resolve(strict=False)
+
+def _unique_destination_path(dest: Path) -> Path:
+    """
+    If dest exists, add " (1)", " (2)" etc before suffix.
+    """
+    if not dest.exists():
+        return dest
+
+    stem = dest.stem
+    suffix = dest.suffix
+    parent = dest.parent
+
+    i = 1
+    while True:
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+def _should_ignore_filename(name: str) -> bool:
+    return name.startswith("._") or name == ".DS_Store"
 
 def main() -> int:
     config = parse_command_line_args()

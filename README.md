@@ -136,7 +136,7 @@ python file-cleanup.py move --dry-run \
   --scan-root /path/to/Music
 ```
 
-Shows what would be moved, but makes no changes.
+Shows what would be moved, but makes no changes. If everything looks correct then proceed to Step 5
 
 ### Step 5 — Move Orphans
 
@@ -158,7 +158,16 @@ A manifest file is written:
 orphans_manifest.jsonl
 ```
 
-### Step 6 — Restore (If Needed)
+### Step 6 — Verify everything is working
+
+Run preview one more time to verify the number of missing files from rekordbox hasn't gone up
+```bash
+python file-cleanup.py preview \
+  --rekordbox-xml /path/to/rekordbox.xml \
+  --scan-root /path/to/Music
+```
+
+### Step 7 — Restore (If Needed)
 
 ```bash
 python file-cleanup.py restore \
@@ -167,6 +176,11 @@ python file-cleanup.py restore \
 ```
 
 Files are moved back to their original locations.
+
+### Step 8 — Delete the files
+
+Assuming everything is verified to be correct, and your Rekordbox Library is unaffected. Then you can go ahead and delete the `_Rekordbox_Orphans` directory.
+Congrats your unused music is no longer taking up space on your hard drive 🤝
 
 ## How It Works (Technical Overview)
 
